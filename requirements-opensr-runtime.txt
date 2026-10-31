@@ -1,0 +1,8 @@
+# OpenSR runtime for the existing project .venv. Keep torch out of this file so
+# its CUDA-enabled build is preserved.
+opensr-utils==1.1.1
+omegaconf>=2.3.0
+scikit-image>=0.22.0
+diffusers>=0.30.3,<1.0
+pytorch-lightning>=2.2.0,<3.0
+matplotlib>=3.8.0

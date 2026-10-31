@@ -1,0 +1,950 @@
+import math
+import pathlib
+from collections.abc import Mapping, MutableMapping
+from numbers import Integral
+from typing import Any, Union
+import requests
+import torch
+from opensr_model.diffusion.latentdiffusion import LatentDiffusion
+from skimage.exposure import match_histograms
+import torch.utils.checkpoint as checkpoint
+from opensr_model.diffusion.utils import DDIMSampler
+from opensr_model.diffusion.dpm_solver import DPMSolverPlusPlusSampler
+from opensr_model.spectral_correction import (
+    BackProjectionConfig,
+    back_projection as correct_back_projection,
+)
+from tqdm import tqdm
+import numpy as np
+from typing import Literal
+import shutil
+import random
+import numpy as np
+from einops import rearrange
+from opensr_model.utils import suppress_stdout
+from opensr_model.utils import assert_tensor_validity
+from opensr_model.utils import revert_padding
+from opensr_model.utils import create_no_data_mask
+from opensr_model.utils import apply_no_data_mask
+
+
+class SRLatentDiffusion(torch.nn.Module):
+    def __init__(self, config, device: Union[str, torch.device] = "cpu"):
+        super().__init__()
+
+        # Set up the model
+        self.config = config
+        self.model = LatentDiffusion(
+            config.first_stage_config,
+            config.cond_stage_config,
+            timesteps=config.denoiser_settings.timesteps,
+            unet_config=config.cond_stage_config,
+            linear_start=config.denoiser_settings.linear_start,
+            linear_end=config.denoiser_settings.linear_end,
+            concat_mode=config.other.concat_mode,
+            cond_stage_trainable=config.other.cond_stage_trainable,
+            first_stage_key=config.other.first_stage_key,
+            cond_stage_key=config.other.cond_stage_key,
+        )
+
+        # Set up the model for inference
+        self.set_normalization()  # decide wether to use norm
+        self.device = device  # set self device
+        self.model.device = device  # set model device as selected
+        self.model = self.model.to(device)  # move model to device
+        self.model.eval()  # set model state
+        self = self.eval()  # set main model state
+        self._X = None  # placeholder for LR image
+        self.encode_conditioning = (
+            config.encode_conditioning
+        )  # encode LR images before dif?
+
+    def set_normalization(self):
+        if self.config.apply_normalization == True:
+            from opensr_model.utils import linear_transform_4b
+
+            self.linear_transform = linear_transform_4b
+        else:
+            from opensr_model.utils import linear_transform_placeholder
+
+            self.linear_transform = linear_transform_placeholder
+            print("Normalization disabled.")
+
+    def _tensor_encode(self, X: torch.Tensor):
+        # set copy to model
+        self._X = X.clone()
+        # normalize image
+        X_enc = self.linear_transform(X, stage="norm")
+        # encode LR images
+        if self.encode_conditioning == True:
+            # try to upsample->encode conditioning
+            X_int = torch.nn.functional.interpolate(
+                X,
+                size=(X.shape[-2] * 4, X.shape[-1] * 4),
+                mode="bilinear",
+                align_corners=False,
+            )
+            # encode conditioning
+            X_enc = self.model.first_stage_model.encode(X_int).sample()
+        # move to same device as the model
+        X_enc = X_enc.to(self.device)
+        return X_enc
+
+    def _tensor_decode(self, X_enc: torch.Tensor, spe_cor: bool = True):
+        # Decode
+        X_dec = self.model.decode_first_stage(X_enc)
+        X_dec = self.linear_transform(X_dec, stage="denorm")
+        # Apply spectral correction
+        if spe_cor:
+            for i in range(X_dec.shape[1]):
+                X_dec[:, i] = self.hq_histogram_matching(X_dec[:, i], self._X[:, i])
+        # If the value is negative, set it to 0
+        X_dec[X_dec < 0] = 0
+        return X_dec
+
+    def _match_output_histograms(
+        self, output: torch.Tensor, reference: torch.Tensor
+    ) -> torch.Tensor:
+        """Match every output band to its corresponding LR input band."""
+
+        if output.ndim != 4 or reference.ndim != 4:
+            raise ValueError("Histogram matching expects batched BCHW tensors")
+        if output.shape[:2] != reference.shape[:2]:
+            raise ValueError(
+                "Histogram matching requires equal batch and channel dimensions"
+            )
+        return torch.stack(
+            [
+                torch.stack(
+                    [
+                        self.hq_histogram_matching(
+                            output[batch, channel], reference[batch, channel]
+                        )
+                        for channel in range(output.shape[1])
+                    ]
+                )
+                for batch in range(output.shape[0])
+            ]
+        )
+
+    def _prepare_model(
+        self,
+        X: torch.Tensor,
+        eta: float = 1.0,
+        custom_steps: int = 100,
+        verbose: bool = False,
+    ):
+        # Switching back from a DPM config may supply a non-dividing step count.
+        if (
+            isinstance(custom_steps, bool)
+            or not isinstance(custom_steps, Integral)
+            or not 1 <= custom_steps < self.model.num_timesteps
+            or self.model.num_timesteps % custom_steps
+        ):
+            raise ValueError(
+                "DDIM sampling_steps must be a positive integer smaller than "
+                "and dividing the number of training timesteps exactly"
+            )
+        # Create the DDIM sampler
+        ddim = DDIMSampler(self.model)
+
+        # make schedule to compute alphas and sigmas
+        ddim.make_schedule(ddim_num_steps=custom_steps, ddim_eta=eta, verbose=verbose)
+
+        # Create the HR latent image
+        latent = torch.randn(X.shape, device=X.device)
+
+        # Create the vector with the timesteps
+        timesteps = ddim.ddim_timesteps
+        time_range = np.flip(timesteps)
+
+        return ddim, latent, time_range
+
+    def _resolve_correction(self, spectral_correction, histogram_matching, back_projection):
+        if spectral_correction is None:
+            spectral_correction = (
+                getattr(self.config, "spectral_correction", "back_projection")
+                if histogram_matching else "none"
+            )
+        if spectral_correction not in ("none", "histogram", "back_projection"):
+            raise ValueError("spectral_correction must be 'none', 'histogram' or 'back_projection'")
+        if spectral_correction != "back_projection":
+            if back_projection is not None:
+                raise ValueError("back_projection options require spectral_correction='back_projection'")
+            return spectral_correction, None
+        options = back_projection
+        if options is None:
+            options = getattr(self.config, "back_projection", {})
+        if isinstance(options, Mapping):
+            options = BackProjectionConfig(**dict(options))
+        if not isinstance(options, BackProjectionConfig):
+            raise ValueError("back_projection must be a mapping or BackProjectionConfig")
+        if options.scale != 4:
+            raise ValueError("OpenSR inference back_projection scale must be 4")
+        options.sigmas(4)
+        return spectral_correction, options
+
+    def _correct_output(self, output, reference, correction, options):
+        if correction == "histogram":
+            return self._match_output_histograms(output, reference)
+        if correction == "back_projection":
+            # Preserve the existing per-band zero-as-nodata convention. Keep
+            # invalid HR support fixed during optimization, not after it.
+            valid = reference != 0
+            support = valid.repeat_interleave(4, -2).repeat_interleave(4, -1)
+            return correct_back_projection(
+                output, reference, options, valid_mask=valid, output_mask=support
+            )
+        return output
+
+    @torch.no_grad()
+    def forward(
+        self,
+        X: torch.Tensor,
+        sampling_eta: float = None,
+        sampling_steps: int = None,
+        sampling_temperature: float = None,
+        histogram_matching: bool = True,
+        save_iterations: bool = False,
+        verbose: bool = False,
+        *,
+        sampler: Literal["ddim", "dpm_solver++"] | None = None,
+        spectral_correction: Literal["none", "histogram", "back_projection"] | None = None,
+        back_projection: BackProjectionConfig | Mapping[str, Any] | None = None,
+    ):
+        """Obtain the super resolution of the given image.
+
+        Args:
+            X (torch.Tensor): If a Sentinel-2 L2A image with reflectance values
+                in the range [0, 1] and shape CxWxH, the super resolution of the image
+                is returned. If a batch of images with shape BxCxWxH is given, a batch
+                of super resolved images is returned.
+            sampling_steps (int, optional): Number of denoiser evaluations. Uses
+                denoiser_settings.sampling_steps when configured; otherwise defaults
+                to 3 for DPM-Solver++ and 100 for DDIM. Explicit arguments override
+                the configured count.
+            sampling_temperature (float, optional): DDIM noise temperature.
+                Defaults to 1.0. The higher the temperature, the more stochastic
+                the denoiser is (random noise gets multiplied by this).
+            histogram_matching (bool, optional): Apply spectral correction to the SR
+                image, using the LR image as reference. Legacy switch: False
+                disables correction unless spectral_correction is explicit.
+            spectral_correction (str, optional): "none", "histogram" or
+                "back_projection". Explicit selection overrides the legacy bool;
+                otherwise use config.spectral_correction (default "back_projection")
+                when histogram_matching=True. Independent of sampler selection.
+            back_projection (BackProjectionConfig or mapping, optional): Options
+                for back-projection; otherwise use config.back_projection or its
+                defaults (4x block means, 100 iterations, tolerance 1e-6).
+                Runs on decoded reflectances with no final clipping. Half inputs
+                are corrected in float32. Zero-valued LR bands remain nodata.
+            sampler (str, optional): "ddim" or "dpm_solver++" (second-order
+                multistep ODE solver). Falls back to denoiser_settings.sampler,
+                then "dpm_solver++" if absent. DPM-Solver++ ignores configured
+                DDIM eta/temperature; explicit overrides must be 0 and 1,
+                respectively. Initial noise and conditioning remain stochastic.
+
+        Returns:
+            torch.Tensor: The super resolved image or batch of images with a shape of
+                Cx(Wx4)x(Hx4) or BxCx(Wx4)x(Hx4).
+        """
+        correction, correction_options = self._resolve_correction(
+            spectral_correction, histogram_matching, back_projection
+        )
+        # Resolve the sampler before interpreting sampler-specific settings.
+        if sampler is None:
+            sampler = getattr(self.config.denoiser_settings, "sampler", "dpm_solver++")
+        if sampler not in ("ddim", "dpm_solver++"):
+            raise ValueError("sampler must be 'ddim' or 'dpm_solver++'")
+        if sampling_steps is None:
+            sampling_steps = getattr(
+                self.config.denoiser_settings, "sampling_steps", None
+            )
+        if sampling_steps is None:
+            sampling_steps = 3 if sampler == "dpm_solver++" else 100
+        dpm_sampler = None
+        if sampler == "ddim":
+            if sampling_eta is None:
+                sampling_eta = self.config.denoiser_settings.sampling_eta
+            if sampling_temperature is None:
+                sampling_temperature = self.config.denoiser_settings.sampling_temperature
+        else:
+            if sampling_eta is not None and sampling_eta != 0.0:
+                raise ValueError("DPM-Solver++ requires sampling_eta=0 or None")
+            if sampling_temperature is not None and sampling_temperature != 1.0:
+                raise ValueError("DPM-Solver++ requires sampling_temperature=1 or None")
+            dpm_sampler = DPMSolverPlusPlusSampler(self.model, sampling_steps)
+
+        # Set potentially problematic values to 0 to avoid issues in the model.
+        X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Assert shape, size, dimensionality. Add padding if necessary
+        X, padding = assert_tensor_validity(X)
+        left, right, top, bottom = padding
+        input_height, input_width = X.shape[-2:]
+        lr_reference = X[
+            :,
+            :,
+            top : input_height - bottom if bottom else input_height,
+            left : input_width - right if right else input_width,
+        ]
+
+        # create no_data_mask
+        no_data_mask = create_no_data_mask(
+            X, target_size=(X.shape[-2] * 4, X.shape[-1] * 4)
+        )
+        # Encoding may normalize its input in-place; retain physical units for
+        # the padded intermediate-frame correction path.
+        iteration_reference = X.clone() if correction == "back_projection" else X
+
+        # Normalize the image
+        X = X.clone()
+        Xnorm = self._tensor_encode(X)
+
+        if dpm_sampler is None:
+            ddim, latent, time_range = self._prepare_model(
+                X=Xnorm, eta=sampling_eta, custom_steps=sampling_steps, verbose=verbose
+            )
+        else:
+            latent = torch.randn(Xnorm.shape, device=Xnorm.device)
+            time_range = dpm_sampler.timesteps
+        iterator = tqdm(
+            time_range, desc=f"{sampler} Sampler", total=sampling_steps, disable=True
+        )
+
+        # Iterate over the timesteps
+        if save_iterations:
+            save_iters = []
+
+        for i, step in enumerate(iterator):
+            if dpm_sampler is None:
+                latent, _ = ddim.p_sample_ddim(
+                    x=latent,
+                    c=Xnorm,
+                    t=step,
+                    index=sampling_steps - i - 1,
+                    use_original_steps=False,
+                    temperature=sampling_temperature,
+                )
+            else:
+                latent = dpm_sampler.step(latent, Xnorm, step)
+
+            if save_iterations:
+                save_iters.append(self._tensor_decode(latent, spe_cor=False))
+
+        if save_iterations:
+            if correction != "none":
+                save_iters = [
+                    self._correct_output(
+                        iteration, iteration_reference, correction, correction_options
+                    )
+                    for iteration in save_iters
+                ]
+            return save_iters
+
+        sr = self._tensor_decode(latent, spe_cor=False)  # decode the latent image
+
+        # Post-processing
+        sr = apply_no_data_mask(sr, no_data_mask)  # apply no data mask as in LR image
+        sr = revert_padding(
+            sr, padding
+        )  # remove padding from the SR image if there was any
+        return self._correct_output(sr, lr_reference, correction, correction_options)
+
+    def hq_histogram_matching(
+        self, image1: torch.Tensor, image2: torch.Tensor
+    ) -> torch.Tensor:
+        """Match an SR output's distribution to its LR input reference.
+
+        The first tensor is the super-resolved source whose values are adjusted.
+        The second tensor is the corresponding low-resolution reference whose
+        spectral distribution is preserved. Spatial sizes may differ because
+        histogram matching compares value distributions rather than pixel locations.
+
+        Args:
+            image1: SR source to adjust, shaped HxW or CxHxW.
+            image2: LR spectral reference, shaped HxW or CxHxW.
+
+        Returns:
+            A tensor with the source shape and its histogram matched to the LR
+            reference.
+
+        Raises:
+            ValueError: If the source is not two- or three-dimensional.
+        """
+
+        # Go to numpy
+        np_image1 = image1.detach().cpu().numpy()
+        np_image2 = image2.detach().cpu().numpy()
+
+        if np_image1.ndim == 3:
+            np_image1_hat = match_histograms(np_image1, np_image2, channel_axis=0)
+        elif np_image1.ndim == 2:
+            np_image1_hat = match_histograms(np_image1, np_image2, channel_axis=None)
+        else:
+            raise ValueError("The input image must have 2 or 3 dimensions.")
+
+        # Go back to torch
+        image1_hat = torch.from_numpy(np_image1_hat).to(image1.device)
+
+        return image1_hat
+
+    @staticmethod
+    def _checkpoint_inference_config(
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        """Extract inference settings from native or Lightning metadata."""
+        metadata = payload.get("metadata")
+        if isinstance(metadata, Mapping) and "opensr_inference_config" in metadata:
+            inference_config = metadata["opensr_inference_config"]
+        elif "opensr_inference_config" in payload:
+            inference_config = payload["opensr_inference_config"]
+        else:
+            return None
+        if not isinstance(inference_config, Mapping):
+            raise RuntimeError("Checkpoint opensr_inference_config must be a mapping")
+        return inference_config
+
+    @staticmethod
+    def _set_config_value(config: Any, key: str, value: Any) -> None:
+        if isinstance(config, MutableMapping):
+            config[key] = value
+        else:
+            setattr(config, key, value)
+
+    @staticmethod
+    def _metadata_bool(mapping: Mapping[str, Any], key: str) -> bool | None:
+        if key not in mapping:
+            return None
+        value = mapping[key]
+        if not isinstance(value, bool):
+            raise RuntimeError(f"Checkpoint inference setting {key!r} must be a bool")
+        return value
+
+    @staticmethod
+    def _metadata_float(
+        mapping: Mapping[str, Any],
+        key: str,
+        *,
+        positive: bool = False,
+        nonnegative: bool = False,
+    ) -> float | None:
+        if key not in mapping:
+            return None
+        value = mapping[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise RuntimeError(f"Checkpoint inference setting {key!r} must be numeric")
+        result = float(value)
+        if not math.isfinite(result):
+            raise RuntimeError(f"Checkpoint inference setting {key!r} must be finite")
+        if positive and result <= 0.0:
+            raise RuntimeError(f"Checkpoint inference setting {key!r} must be positive")
+        if nonnegative and result < 0.0:
+            raise RuntimeError(
+                f"Checkpoint inference setting {key!r} must be non-negative"
+            )
+        return result
+
+    def _prepare_checkpoint_inference_config(
+        self,
+        inference_config: Mapping[str, Any],
+        state_dict: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Validate metadata without mutating the live model or its config."""
+        prepared: dict[str, Any] = {}
+        apply_normalization = self._metadata_bool(
+            inference_config, "apply_normalization"
+        )
+        encode_conditioning = self._metadata_bool(
+            inference_config, "encode_conditioning"
+        )
+        if apply_normalization is not None:
+            prepared["apply_normalization"] = apply_normalization
+        if encode_conditioning is not None:
+            prepared["encode_conditioning"] = encode_conditioning
+
+        if "denoiser_settings" not in inference_config:
+            return prepared
+        denoiser = inference_config["denoiser_settings"]
+        if not isinstance(denoiser, Mapping):
+            raise RuntimeError(
+                "Checkpoint inference setting 'denoiser_settings' must be a mapping"
+            )
+
+        if "timesteps" in denoiser:
+            timesteps_value = denoiser["timesteps"]
+            if (
+                isinstance(timesteps_value, bool)
+                or not isinstance(timesteps_value, int)
+                or timesteps_value <= 0
+            ):
+                raise RuntimeError(
+                    "Checkpoint inference setting 'timesteps' must be a positive int"
+                )
+            prepared["timesteps"] = int(timesteps_value)
+
+        linear_start = self._metadata_float(denoiser, "linear_start", positive=True)
+        linear_end = self._metadata_float(denoiser, "linear_end", positive=True)
+        if linear_start is not None:
+            prepared["linear_start"] = linear_start
+        if linear_end is not None:
+            prepared["linear_end"] = linear_end
+        if linear_start is not None and linear_start >= 1.0:
+            raise RuntimeError(
+                "Checkpoint inference setting 'linear_start' must be below 1"
+            )
+        if linear_end is not None and linear_end >= 1.0:
+            raise RuntimeError(
+                "Checkpoint inference setting 'linear_end' must be below 1"
+            )
+        if (
+            linear_start is not None
+            and linear_end is not None
+            and linear_start > linear_end
+        ):
+            raise RuntimeError(
+                "Checkpoint inference schedule requires linear_start <= linear_end"
+            )
+
+        if "parameterization" in denoiser:
+            parameterization = denoiser["parameterization"]
+            if parameterization != "eps":
+                raise RuntimeError(
+                    "OpenSR inference requires checkpoint parameterization='eps'"
+                )
+            prepared["parameterization"] = parameterization
+
+        # Metadata without a sampler describes the historical DDIM protocol.
+        checkpoint_sampler = denoiser.get("sampler", "ddim")
+        if checkpoint_sampler not in ("ddim", "dpm_solver++"):
+            raise RuntimeError(
+                "Checkpoint inference sampler must be 'ddim' or 'dpm_solver++'"
+            )
+        if "sampler" in denoiser:
+            prepared["sampler"] = checkpoint_sampler
+
+        sampling_steps = denoiser.get("sampling_steps")
+        if sampling_steps is not None:
+            if (
+                isinstance(sampling_steps, bool)
+                or not isinstance(sampling_steps, int)
+                or sampling_steps <= 0
+            ):
+                raise RuntimeError(
+                    "Checkpoint inference setting 'sampling_steps' must be a positive int"
+                )
+            prepared["sampling_steps"] = int(sampling_steps)
+        sampling_eta = self._metadata_float(denoiser, "sampling_eta", nonnegative=True)
+        sampling_temperature = self._metadata_float(
+            denoiser, "sampling_temperature", nonnegative=True
+        )
+        if sampling_eta is not None:
+            prepared["sampling_eta"] = sampling_eta
+        if sampling_temperature is not None:
+            prepared["sampling_temperature"] = sampling_temperature
+
+        declared_timesteps = prepared.get("timesteps")
+        effective_timesteps = (
+            self.model.num_timesteps
+            if declared_timesteps is None
+            else int(declared_timesteps)
+        )
+        if sampling_steps is not None and sampling_steps >= effective_timesteps:
+            raise RuntimeError(
+                "Checkpoint inference sampling_steps must be smaller than timesteps"
+            )
+        if (
+            checkpoint_sampler == "ddim"
+            and sampling_steps is not None
+            and effective_timesteps % sampling_steps
+        ):
+            raise RuntimeError(
+                "Checkpoint inference sampling_steps must divide timesteps exactly "
+                "for the native uniform DDIM sampler"
+            )
+
+        checkpoint_betas = state_dict.get("betas")
+        if declared_timesteps is not None:
+            if not isinstance(checkpoint_betas, torch.Tensor):
+                raise RuntimeError(
+                    "Checkpoint inference metadata declares timesteps, but the native "
+                    "state_dict has no 'betas' tensor"
+                )
+            checkpoint_timesteps = int(checkpoint_betas.numel())
+            if checkpoint_timesteps != declared_timesteps:
+                raise RuntimeError(
+                    "Checkpoint inference metadata declares "
+                    f"timesteps={declared_timesteps}, but state_dict['betas'] has "
+                    f"{checkpoint_timesteps} values"
+                )
+
+        if isinstance(checkpoint_betas, torch.Tensor) and checkpoint_betas.numel():
+            for setting, index in (("linear_start", 0), ("linear_end", -1)):
+                if setting not in prepared:
+                    continue
+                stored = float(checkpoint_betas.reshape(-1)[index].detach().cpu())
+                if not math.isclose(
+                    prepared[setting], stored, rel_tol=1.0e-6, abs_tol=1.0e-9
+                ):
+                    raise RuntimeError(
+                        f"Checkpoint inference metadata {setting}={prepared[setting]} "
+                        f"does not match state_dict['betas'] ({stored})"
+                    )
+        return prepared
+
+    def _apply_checkpoint_inference_config(self, settings: Mapping[str, Any]) -> None:
+        """Apply settings only after the checkpoint has strict-loaded."""
+        denoiser_config = self.config.denoiser_settings
+        for key in (
+            "timesteps",
+            "linear_start",
+            "linear_end",
+            "parameterization",
+            "sampler",
+            "sampling_steps",
+            "sampling_eta",
+            "sampling_temperature",
+        ):
+            if key in settings:
+                self._set_config_value(denoiser_config, key, settings[key])
+
+        if "timesteps" in settings:
+            self.model.num_timesteps = int(settings["timesteps"])
+        if "linear_start" in settings:
+            self.model.linear_start = float(settings["linear_start"])
+        if "linear_end" in settings:
+            self.model.linear_end = float(settings["linear_end"])
+        if "parameterization" in settings:
+            self.model.parameterization = str(settings["parameterization"])
+
+        if "apply_normalization" in settings:
+            self._set_config_value(
+                self.config, "apply_normalization", settings["apply_normalization"]
+            )
+            self.set_normalization()
+        if "encode_conditioning" in settings:
+            self._set_config_value(
+                self.config, "encode_conditioning", settings["encode_conditioning"]
+            )
+            self.encode_conditioning = bool(settings["encode_conditioning"])
+
+    def load_pretrained(self, weights_file: str):
+        """
+        Loads pretrained model weights from a local file or downloads them from Hugging Face if not present.
+
+        If the specified `weights_file` does not exist locally, it is automatically downloaded from the
+        Hugging Face model hub under `simon-donike/RS-SR-LTDF`. A progress bar is shown during download.
+
+        After loading, the method removes any perceptual loss-related weights from the state dict and
+        loads the remaining weights into the model.
+
+        Args:
+            weights_file (str): Path to the local weights file. If the file is not found, it will be downloaded
+                                using this name from the Hugging Face repository.
+
+        Raises:
+            RuntimeError: If the weights cannot be loaded or parsed correctly.
+
+        Example:
+            self.load_pretrained("model_weights.ckpt")
+        """
+
+        weights_path = pathlib.Path(weights_file)
+        hf_model = f"https://huggingface.co/simon-donike/RS-SR-LTDF/resolve/main/{weights_file}"
+
+        if not weights_path.exists():
+            tmp_path = weights_path.with_name(f"{weights_path.name}.tmp")
+            print("Downloading pretrained weights from: ", hf_model)
+            try:
+                with requests.get(hf_model, stream=True, timeout=30) as response:
+                    response.raise_for_status()
+                    total_size = int(response.headers.get("content-length", 0))
+                    block_size = 1024  # 1 Kibibyte
+
+                    with tmp_path.open("wb") as f:
+                        with tqdm(
+                            total=total_size,
+                            unit="iB",
+                            unit_scale=True,
+                            desc=weights_file,
+                        ) as bar:
+                            for data in response.iter_content(block_size):
+                                if not data:
+                                    continue
+                                bar.update(len(data))
+                                f.write(data)
+                tmp_path.replace(weights_path)
+            except Exception as exc:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+                raise RuntimeError(
+                    f"Failed to download pretrained weights from {hf_model}"
+                ) from exc
+
+        try:
+            payload = torch.load(
+                weights_path, map_location=self.device, weights_only=True
+            )
+            if not isinstance(payload, Mapping):
+                raise TypeError("checkpoint payload must be a mapping")
+            weights = payload["state_dict"]
+            if not isinstance(weights, Mapping):
+                raise TypeError("checkpoint state_dict must be a mapping")
+            inference_config = self._checkpoint_inference_config(payload)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load pretrained weights from {weights_path}"
+            ) from exc
+
+        # Remote perceptual tensors from weights
+        weights = {key: value for key, value in weights.items() if "loss" not in key}
+
+        prepared_settings: dict[str, Any] | None = None
+        if inference_config is not None:
+            prepared_settings = self._prepare_checkpoint_inference_config(
+                inference_config, weights
+            )
+            checkpoint_timesteps = prepared_settings.get("timesteps")
+            if (
+                checkpoint_timesteps is not None
+                and checkpoint_timesteps != self.model.num_timesteps
+            ):
+                if not {"linear_start", "linear_end"} <= prepared_settings.keys():
+                    raise RuntimeError(
+                        "Checkpoint inference metadata must include linear_start and "
+                        "linear_end when timesteps differs from the configured model"
+                    )
+                self.model.register_schedule(
+                    timesteps=int(checkpoint_timesteps),
+                    linear_start=float(prepared_settings["linear_start"]),
+                    linear_end=float(prepared_settings["linear_end"]),
+                )
+                self.model.to(self.device)
+
+        self.model.load_state_dict(weights, strict=True)
+        if prepared_settings is not None:
+            self._apply_checkpoint_inference_config(prepared_settings)
+        print("Loaded pretrained weights from: ", weights_file)
+
+    def uncertainty_map(
+        self, x, n_variations=15, sampling_steps=None, *, sampler=None,
+        spectral_correction=None, back_projection=None, histogram_matching=True,
+    ):
+        """
+        Estimates uncertainty maps for each sample in the input batch using repeated stochastic forward passes.
+
+        For each input sample, the method generates multiple super-resolved outputs by varying the random seed.
+        It then computes the per-pixel standard deviation across these outputs as a proxy for uncertainty.
+        The returned uncertainty map represents the average width of the confidence interval per pixel.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W), where B is batch size.
+            n_variations (int): Number of stochastic forward passes per input sample.
+            sampling_steps (int, optional): Sampling steps passed to forward;
+                omitted counts use the same config and sampler defaults as forward.
+            sampler (str, optional): Sampler passed to forward; defaults to config.
+            spectral_correction, back_projection, histogram_matching: Same
+                correction selection/options as forward, applied to every draw.
+
+        Returns:
+            torch.Tensor: Uncertainty maps of shape (B, 1, H, W), where each value indicates pixel-wise uncertainty.
+        """
+        assert (
+            n_variations > 3
+        ), "n_variations must be greater than 3 to compute uncertainty."
+
+        batch_size = x.shape[0]
+        rand_seed_list = random.sample(range(1, 9999), n_variations)
+
+        all_variations = []
+        for b in range(batch_size):
+            variations = []
+            x_b = x[b].unsqueeze(0)  # shape (1, 4, 512, 512)
+            for seed in rand_seed_list:
+                with suppress_stdout():
+                    np.random.seed(seed)
+                    torch.manual_seed(seed)
+                    random.seed(seed)
+                    # pytorch_lightning.utilities.seed.seed_everything(seed=seed, workers=True)
+
+                sr = self.forward(
+                    x_b,
+                    sampling_steps=sampling_steps,
+                    sampling_eta=0.0,
+                    sampler=sampler,
+                    spectral_correction=spectral_correction,
+                    back_projection=back_projection,
+                    histogram_matching=histogram_matching,
+                )  # shape (1, C, H, W)
+                variations.append(sr.detach().cpu())
+
+            variations = torch.stack(variations)  # (n_variations, 1, C, H, W)
+            srs_stdev = variations.std(dim=0)
+            interval_size = (srs_stdev * 2).mean(dim=1)  # mean over channels
+
+            all_variations.append(interval_size)  # each is (1, H, W)
+
+        result = torch.stack(all_variations)  # (B, 1, H, W)
+        return result
+
+    def _attribution_methods(
+        self,
+        X: torch.Tensor,
+        grads: torch.Tensor,
+        attribution_method: Literal[
+            "grad_x_input", "max_grad", "mean_grad", "min_grad"
+        ],
+    ):
+        """
+        DEPRECIATED; SUBJECT TO REMOVAL
+        """
+        if attribution_method == "grad_x_input":
+            return torch.norm(grads * X, dim=(0, 1))
+        elif attribution_method == "max_grad":
+            return grads.abs().max(dim=0).max(dim=0)
+        elif attribution_method == "mean_grad":
+            return grads.abs().mean(dim=0).mean(dim=0)
+        elif attribution_method == "min_grad":
+            return grads.abs().min(dim=0).min(dim=0)
+        else:
+            raise ValueError(
+                "The attribution method must be one of: grad_x_input, max_grad, mean_grad, min_grad"
+            )
+
+    def explainer(
+        self,
+        X: torch.Tensor,
+        mask: torch.Tensor,
+        eta: float = 0.0,
+        temperature: float = 1.0,
+        custom_steps: int = 100,
+        steps_to_consider_for_attributions: list = list(range(100)),
+        attribution_method: Literal[
+            "grad_x_input", "max_grad", "mean_grad", "min_grad"
+        ] = "grad_x_input",
+        verbose: bool = False,
+        enable_checkpoint=True,
+        histogram_matching=True,
+    ):
+        """
+        DEPRECIATED; SUBJECT TO REMOVAL
+        """
+        # Normalize and encode the LR image
+        X = X.clone()
+        Xnorm = self._tensor_encode(X)
+
+        # ddim, latent and time_range
+        ddim, latent, time_range = self._prepare_model(
+            X=Xnorm, eta=eta, custom_steps=custom_steps, verbose=verbose
+        )
+
+        # Iterate over the timesteps
+        container = []
+        iterator = tqdm(
+            time_range, desc="DDIM Sampler", total=custom_steps, disable=True
+        )
+        for i, step in enumerate(iterator):
+
+            # Activate or deactivate gradient tracking
+            if i in steps_to_consider_for_attributions:
+                torch.set_grad_enabled(True)
+            else:
+                torch.set_grad_enabled(False)
+
+            # Compute the latent image
+            if enable_checkpoint:
+                outs = checkpoint.checkpoint(
+                    ddim.p_sample_ddim,
+                    latent,
+                    Xnorm,
+                    step,
+                    custom_steps - i - 1,
+                    temperature,
+                    use_reentrant=False,
+                )
+            else:
+                outs = ddim.p_sample_ddim(
+                    x=latent,
+                    c=Xnorm,
+                    t=step,
+                    index=custom_steps - i - 1,
+                    temperature=temperature,
+                )
+            latent, _ = outs
+
+            if i not in steps_to_consider_for_attributions:
+                continue
+
+            # Apply the mask
+            output_graph = (latent * mask).mean()
+
+            # Compute the gradients
+            grads = torch.autograd.grad(output_graph, Xnorm, retain_graph=True)[0]
+
+            # Compute the attribution and save it
+            with torch.no_grad():
+                to_save = {
+                    "latent": self._tensor_decode(latent, spe_cor=histogram_matching),
+                    "attribution": self._attribution_methods(
+                        Xnorm, grads, attribution_method
+                    ),
+                }
+            container.append(to_save)
+
+        return container
+
+
+# -----------------------------------------------------------------------------
+# Logic to create PyTorch Lightning Model from dif model
+# Logic to handle outputs from PL model and save them
+# -----------------------------------------------------------------------------
+
+import torch
+import pytorch_lightning
+from pytorch_lightning import LightningModule
+
+
+class SRLatentDiffusionLightning(LightningModule):
+    """
+    This Pytorch Lightning Class wraps around the torch model to
+    aid in distrubuted GPU processing and optimized dataloaders
+    provided by PL. ToDo: implement demo showcase
+    """
+
+    def __init__(self, config, device: Union[str, torch.device] = "cpu"):
+        super().__init__()
+        self.model = SRLatentDiffusion(config, device=device)
+        self.model = self.model.eval()
+
+    @torch.no_grad()
+    def forward(self, x, **kwargs):
+        # print("Dont call 'forward' on the PL model, instead use 'predict'")
+        return self.model(x, **kwargs)
+
+    def load_pretrained(self, weights_file: str):
+        self.model.load_pretrained(weights_file)
+        print("PL Model: Model loaded from ", weights_file)
+
+    @torch.no_grad()
+    def predict_step(self, x, idx: int = 0, dataloader_idx: int = 0, **kwargs):
+        # perform SR
+        assert (
+            self.model.training == False
+        ), "Model in Training mode. Abort."  # make sure we're in eval
+        x = torch.nan_to_num(
+            x, nan=0.0, posinf=0.0, neginf=0.0
+        )  # replace nans and infs in input with 0s
+        p = self.model.forward(x, **kwargs)
+        return p
+
+    @torch.no_grad()
+    def uncertainty_map(
+        self, x, n_variations=15, sampling_steps=None, custom_steps=None, *,
+        sampler=None, **correction_kwargs,
+    ):
+        if custom_steps is not None:
+            sampling_steps = custom_steps
+        uncertainty_map = self.model.uncertainty_map(
+            x, n_variations, sampling_steps, sampler=sampler, **correction_kwargs
+        )
+        return uncertainty_map
