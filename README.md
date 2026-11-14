@@ -1,4 +1,4 @@
-# Cloud Removal Model
+# CloudVision AI
 
 ### Sentinel-2 Cloud Reconstruction with ECRformer and Diffusion-Based Super-Resolution
 
@@ -34,6 +34,24 @@ This project addresses the problem through a two-stage pipeline:
    - Output resolution: **2.5 m-equivalent**.
 
 The complete workflow is exposed through an interactive Streamlit application.
+
+CloudVision AI integrates pretrained ECRformer weights for cloud reconstruction and an optional LDSR-S2/OpenSR stage for super-resolution. The reports also review CNN, GAN, Transformer, diffusion, SAR-optical, and multi-temporal methods; those comparisons provide research context and do not mean every reviewed method is implemented in this application.
+
+## Screenshots
+
+The screenshots below show the application workflow. Quantitative reconstruction metrics require a suitable clear reference; the displayed runs explicitly indicate when one was not supplied.
+
+### Live satellite acquisition
+
+![CloudVision AI live CDSE acquisition and area-of-interest selection](assets/screenshots/live-acquisition.jpg)
+
+### ECRformer cloud reconstruction
+
+![Cloudy Sentinel-2 input, Sentinel-1 SAR, and ECRformer reconstruction with reference-free diagnostics](assets/screenshots/ecrformer-reconstruction.jpg)
+
+### Optional OpenSR super-resolution
+
+![OpenSR four-band super-resolution output and evaluation caveats](assets/screenshots/opensr-super-resolution.jpg)
 
 ---
 
@@ -137,6 +155,8 @@ The harmonization stage handles:
 ## 4. ECRformer Cloud Reconstruction
 
 ECRformer is the primary cloud-removal model in the pipeline.
+
+The application runs ECRformer with pretrained weights. This repository integrates its inference workflow; it does not claim that the model was trained from scratch here.
 
 ### Inputs
 
@@ -353,8 +373,8 @@ The current development pipeline has been verified on an NVIDIA GeForce RTX 3050
 ### Clone the Repository
 
 ```powershell
-git clone https://github.com/dattarajdev/satellite-cloud-removal-super-resolution.git
-cd satellite-cloud-removal-super-resolution
+git clone https://github.com/chaitanyasn0509/Cloud-Vision-AI.git
+cd Cloud-Vision-AI
 ```
 
 ### Create the Main Python Environment
@@ -769,8 +789,8 @@ The output preserves CRS, geographic bounds, and spatial alignment while increas
 Clone the repository:
 
 ```powershell
-git clone https://github.com/dattarajdev/satellite-cloud-removal-super-resolution.git
-cd satellite-cloud-removal-super-resolution
+git clone https://github.com/chaitanyasn0509/Cloud-Vision-AI.git
+cd Cloud-Vision-AI
 ```
 
 Create your own development environment and install dependencies.
